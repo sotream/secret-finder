@@ -20,6 +20,11 @@ PASSWORD = "Zx9" + "!qW4rT7yU2"
 PEM_HEADER = "-----BEGIN OPENSSH " + "PRIVATE KEY-----"
 
 
+JWT = "eyJ" + "hbGciOiJIUzI1NiJ9." + "eyJ" + "zdWIiOiIxMjM0NTY3ODkw." + "dozjgNryP4J3jVmNHl0w5N"
+GITLAB = "glpat-" + "abcdefghij0123456789"
+NPM = "npm_" + "abcdefghijklmnopqrstuvwxyz0123456789"
+
+
 def make_diff(path, added, start=1, extra_hunks=""):
     body = "".join(f"+{line}\n" for line in added)
     return (
@@ -122,6 +127,34 @@ class DetectionTests(unittest.TestCase):
         self.assertNotIn(PASSWORD, rendered)
 
 
+class ExtendedDetectionTests(unittest.TestCase):
+    def rules(self, line):
+        return [r.name for r, _ in sf.scan_line(line)]
+
+    def test_new_token_formats(self):
+        self.assertEqual(self.rules(f"t = {JWT}"), ["JSON Web Token"])
+        self.assertEqual(self.rules(f"t: {GITLAB}"), ["GitLab token"])
+        self.assertEqual(self.rules(f"//registry/:_authToken={NPM}"), ["npm token"])
+
+    def test_url_credentials(self):
+        self.assertEqual(self.rules(f"u = 'postgres://admin:{PASSWORD}@db.internal/app'"),
+                         ["Credentials in URL"])
+        self.assertEqual(self.rules("u = 'postgres://admin:${DB_PASS}@db/app'"), [])
+
+    def test_unquoted_and_backtick_assignments(self):
+        for line in (f"DB_PASSWORD={PASSWORD}", f"password: {PASSWORD}", f"const password = `{PASSWORD}`"):
+            self.assertEqual(self.rules(line), ["Hard-coded credential assignment"], line)
+
+    def test_false_positives_stay_quiet(self):
+        for line in ("sk-learn-compatible-estimator-wrapper-class-name",
+                     'password = "get_password_from_vault"',
+                     'token_class = "some-long-css-class"',
+                     "password = self.password_value",
+                     "token: some-long-css-class",
+                     "password: ${DB_PASSWORD}"):
+            self.assertEqual(self.rules(line), [], line)
+
+
 class CliTests(unittest.TestCase):
     def run_cli(self, argv, env=None):
         out, err = io.StringIO(), io.StringIO()
@@ -217,6 +250,26 @@ class GitIntegrationTests(unittest.TestCase):
         self.assertEqual(self.run_cli(["--commit", "HEAD"])[0], 1)
         self.assertEqual(self.run_cli(["--commit", "HEAD~1"])[0], 0)
         self.assertEqual(self.run_cli(["--base", "main"])[0], 1)
+
+    def test_untracked_files_are_scanned_by_default(self):
+        self.write("a.txt", "x\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "init")
+        self.write(".env", f"DB_PASSWORD={PASSWORD}\n")
+        self.write("my file.py", f'K = "{AWS_KEY}"\n')
+        code, out = self.run_cli([])
+        self.assertEqual(code, 1)
+        self.assertIn(".env:1", out)
+        self.assertIn("my file.py:1", out)
+        self.assertEqual(self.run_cli(["--staged"])[0], 0)  # explicit modes stay scoped
+
+    def test_gitignored_untracked_files_are_skipped(self):
+        self.write("a.txt", "x\n")
+        self.write(".gitignore", ".env\n")
+        self.git("add", ".")
+        self.git("commit", "-qm", "init")
+        self.write(".env", f"DB_PASSWORD={PASSWORD}\n")
+        self.assertEqual(self.run_cli([])[0], 0)
 
     def test_bad_ref_is_operational_error(self):
         self.write("a.txt", "x\n")

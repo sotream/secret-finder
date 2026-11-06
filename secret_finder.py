@@ -126,9 +126,19 @@ TIER1_RULES: Tuple[Rule, ...] = (
     Rule("Anthropic API key", "CRITICAL", re.compile(
         r"\bsk-ant-[A-Za-z0-9_-]{32,}\b")),
     Rule("OpenAI API key", "CRITICAL", re.compile(
-        r"\bsk-(?:proj-)?[A-Za-z0-9_-]{32,}\b")),
+        r"\bsk-(?:proj-)?(?=[A-Za-z0-9_-]*\d)[A-Za-z0-9_-]{32,}\b")),  # digit required: skips sk-kebab-slugs
     Rule("Google API key", "CRITICAL", re.compile(
         r"\bAIza[0-9A-Za-z_-]{35}\b")),
+    Rule("GitLab token", "CRITICAL", re.compile(r"\bglpat-[A-Za-z0-9_-]{20,}")),
+    Rule("npm token", "CRITICAL", re.compile(r"\bnpm_[A-Za-z0-9]{36}\b")),
+    Rule("SendGrid API key", "CRITICAL", re.compile(
+        r"\bSG\.[A-Za-z0-9_-]{22}\.[A-Za-z0-9_-]{43}\b")),
+    Rule("Slack webhook URL", "CRITICAL", re.compile(
+        r"https://hooks\.slack\.com/services/T[A-Z0-9]+/B[A-Z0-9]+/[A-Za-z0-9]{20,}")),
+    Rule("Azure storage account key", "CRITICAL", re.compile(
+        r"AccountKey=([A-Za-z0-9+/]{60,}={0,2})"), group=1),
+    Rule("JSON Web Token", "HIGH", re.compile(
+        r"\beyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}")),
 )
 
 # `password = "..."`, `"api_key": "..."`, `token: '...'` -- value must be a
@@ -136,14 +146,28 @@ TIER1_RULES: Tuple[Rule, ...] = (
 _ASSIGNMENT_RE = re.compile(
     r"""(?ix)
     [\w.-]*(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[\w.-]*
-    ["']?\s*[:=]\s*
-    ["'](?P<value>[^"'\s]{8,})["']
+    ["'`]?\s*[:=]\s*
+    ["'`](?P<value>[^"'`\s]{8,})["'`]
     """
 )
+# `DB_PASSWORD=abc123...` in .env / YAML / ini: unquoted, and the value must be
+# the rest of the line and contain a digit or symbol (so `password = self.pw`
+# and `token: some-css-class` are not flagged).
+_UNQUOTED_ASSIGNMENT_RE = re.compile(
+    r"""(?ix)
+    [\w.-]*(?:passw(?:or)?d|pwd|secret|token|api[_-]?key|access[_-]?key|private[_-]?key)[\w.-]*
+    \s*[:=]\s*
+    (?P<value>(?=[A-Za-z0-9_@%^&*+/!~-]*[0-9@%^&*+!~])[A-Za-z0-9_@%^&*+/!~-]{8,}=*)\s*$
+    """
+)
+# credentials embedded in a URL authority
+_URL_CRED_RE = re.compile(r"(?i)\b[a-z][a-z0-9+.-]*://[^\s:/@\"'`]+:(?P<value>[^\s:/@\"'`]{4,})@")
 _BEARER_RE = re.compile(r"(?i)\bbearer\s+(?P<value>[A-Za-z0-9._~+/-]{20,}=*)")
 
 TIER2_RULES: Tuple[Rule, ...] = (
     Rule("Hard-coded credential assignment", "HIGH", _ASSIGNMENT_RE, group=1),
+    Rule("Hard-coded credential assignment", "HIGH", _UNQUOTED_ASSIGNMENT_RE),
+    Rule("Credentials in URL", "HIGH", _URL_CRED_RE),
     Rule("Bearer token", "HIGH", _BEARER_RE, group=1),
 )
 
@@ -155,6 +179,8 @@ _PLACEHOLDER_RE = re.compile(
 _TIER2_ONLY_PLACEHOLDER_RE = re.compile(r"(?i)test|sample|fake|mock")
 # Values that are references to a secret, not the secret itself.
 _REFERENCE_VALUE_RE = re.compile(r"^(?:\$|%|\{|<|\*{3,})")
+# Identifier/slug-like values (`get_password_from_vault`, `some-css-class`).
+_WORDLIKE_RE = re.compile(r"^[A-Za-z]+(?:[_.-][A-Za-z]+)+$")
 # A line that reads the secret from the environment is the *right* pattern.
 _ENV_ACCESS_RE = re.compile(
     r"process\.env\b|os\.environ|os\.getenv|System\.getenv|\$ENV\b|ENV\[|getenv\(|\$\{[A-Z_]+\}"
@@ -201,7 +227,7 @@ def scan_line(text: str) -> List[Tuple[Rule, str]]:
             value = m.group("value")
             if _PLACEHOLDER_RE.search(value) or _TIER2_ONLY_PLACEHOLDER_RE.search(value):
                 continue
-            if _REFERENCE_VALUE_RE.match(value):
+            if _REFERENCE_VALUE_RE.match(value) or _WORDLIKE_RE.match(value):
                 continue
             hits.append((rule, value))
     return hits
@@ -247,6 +273,21 @@ def _has_head() -> bool:
     ).returncode == 0
 
 
+def _untracked_diff() -> str:
+    """Diff of untracked, non-ignored files: `git diff HEAD` never shows them."""
+    names = _git(["git", "ls-files", "--others", "--exclude-standard", "-z"]).split("\0")
+    parts = []
+    for name in filter(None, names):
+        # --no-index exits 1 when the files differ, which is the normal case here.
+        proc = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "diff", "--no-index", "-U0", "--no-color",
+             "--no-ext-diff", "--", os.devnull, name],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False)
+        if proc.returncode in (0, 1):
+            parts.append(proc.stdout.decode("utf-8", "replace"))
+    return "".join(parts)
+
+
 def read_diff(args: argparse.Namespace) -> str:
     if args.file:
         if args.file == "-":
@@ -264,9 +305,8 @@ def read_diff(args: argparse.Namespace) -> str:
     if args.staged:
         return _git(_GIT_DIFF_BASE + ["--cached"])
     # Default: everything uncommitted (staged + unstaged) against HEAD.
-    if _has_head():
-        return _git(_GIT_DIFF_BASE + ["HEAD"])
-    return _git(_GIT_DIFF_BASE + ["--cached"])
+    tracked = _git(_GIT_DIFF_BASE + (["HEAD"] if _has_head() else ["--cached"]))
+    return tracked + _untracked_diff()
 
 
 # --------------------------------------------------------------------------- #
