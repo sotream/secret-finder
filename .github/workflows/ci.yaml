@@ -1,0 +1,50 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        python: ["3.9", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest -v
+
+  # The tool scans its own changes: dogfooding doubles as an integration test.
+  self-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Scan pull request changes
+        if: github.event_name == 'pull_request'
+        run: python secret_finder.py --base "origin/${{ github.base_ref }}"
+      - name: Scan pushed commit
+        if: github.event_name == 'push'
+        run: python secret_finder.py --commit HEAD
+
+  # Single stable name for branch protection.
+  check:
+    needs: [test, self-scan]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          [ "${{ needs.test.result }}" = "success" ] && [ "${{ needs.self-scan.result }}" = "success" ]
